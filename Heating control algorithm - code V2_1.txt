@@ -1,0 +1,864 @@
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--
+-- Functionality for heating and hot water control
+--
+-- Uses user variables for boiler parameters, pre-heat time limits, etc and zone definitions
+-- Each zone should be associated with an indoor sensor, an outdoor sensor and a zone valve
+--
+-- Jeff T, September 2020, October 2020
+--
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--
+-- TO DO:
+--
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- Supporting functions
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+function lognote(domoticz, note)
+-- 
+-- Debug logging... set DEBUG_INFO to true to enable all the informational logging stuff in the other functions
+--
+
+    --local DEBUG_INFO = false
+    local DEBUG_INFO = true
+
+    if DEBUG_INFO == true then
+        domoticz.log(note, domoticz.LOG_INFO)
+    end
+end
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+function getHeatingTime (domoticz, temps, params)
+-- Function to calculate what proportion of its time the heating needs to be on for and at what temperature, to meet the desired temperature at the right time
+--
+-- Jeff T, 11/09/2020
+--
+-- Changes:
+--   20/09/20 - add hysteresis functionality (used for current sepoints to avoid short-cycling the heat for small variations in room temperature; recommend 0.5~1.0C for rooms and 2~3C for hot water stores)
+--   11/10/20 - add heat source warm-up time into the calculation
+
+-- temps is an array: {tRoomNow - current room temp, tRoomTarget, - target room temp, pTarget - when to hit target temp (minutes from now), tOutNow - current outdoor temp, tOutPredict - expected outdoor temp @ pTarget}
+-- params is an array: {rIncrease - rate of room temp rise, degC per minute per degC of water - room difference, rDecrease, - rate of room temp decrease, degC per minute per degC of room - outdoor difference, tWaterMin - min workable water temp, tWaterMax - max workable water temp, tWRDiffMin - minimum useful water-room difference,
+--                      tFlow = heat source output temp, tReturn = heat source return temp, rWarmUp = heat source warm-up rate, degC/min}
+-- Note that rDecrease and rIncrease are both expressed as positive values!
+-- returns tWater - water temperature required, pHeat - percentage of time for which heat ; both will be zero if no heat is needed
+
+    lognote(domoticz, '     getHeatingTime: tRoomTarget=' .. temps.tRoomTarget)
+    lognote(domoticz, '                   : pTarget=' .. temps.pTarget)
+
+    -- Calculations!
+    local tRoomMean = (temps.tRoomNow + temps.tRoomTarget) / 2              -- mean room temp for the period
+    local tIBaseMin = (temps.tRoomTarget - temps.tRoomNow) / temps.pTarget  -- increase required, per minute, without loss to outside
+    local tOutMean = (temps.tOutNow + temps.tOutPredict) / 2                -- mean outdoor temp for the period
+    local tDecMin = (tRoomMean - tOutMean) * params.rDecrease               -- decrease per minute through loss to outside
+    local tIncMin = tIBaseMin + tDecMin                                     -- net increase required, per minute
+    local tEndTempUnheated = temps.tRoomNow - (tDecMin * temps.pTarget)           -- expected final temperature
+    local tRR = tIncMin / params.rIncrease                                  -- water-to-room temp difference needed
+    if params.hysteresis == nil or params.hysteresis < 0 then
+        params.hysteresis = 0
+    end
+    local tSupply = params.tFlow       -- later, might do some calculation using flow and return to represent more closely the heat in the system rather than just at the source
+    lognote(domoticz, '     getHeatingTime: tRoomMean=' .. tRoomMean .. ', tIBaseMin=' .. tIBaseMin .. ', tOutMean=' .. tOutMean .. ', tDecMin=' .. tDecMin .. ', tIncMin=' .. tIncMin .. ', tRR=' .. tRR .. ', end temp unheated=' .. tEndTempUnheated .. ', hysteresis=' .. params.hysteresis .. ', tFlow ' .. params.tFlow .. ', tReturn ' .. params.tReturn .. ', rWarmUp ' .. params.rWarmUp)
+    
+    -- apply hysteresis... if we are within bounds and will remain so without heating, then don't heat; this is only helpful on current setpoints, set it to zero for future setpoints
+    if math.abs(tEndTempUnheated - temps.tRoomTarget) < params.hysteresis and math.abs(temps.tRoomNow - temps.tRoomTarget) < params.hysteresis then
+        tWaterUse = 0
+        pHeatPC = 0 
+        lognote(domoticz, '     getHeatingTime: predicted final temperature is within hysteresis limits.  No heat needed; returning zero water temp/heat %')
+        return tWaterUse, pHeatPC
+    end
+
+    -- if the water-to-room differential required is < 0, that's 'no heat required'
+    if tRR < 0 then
+        tWaterUse = 0
+        pHeatPC = 0 
+        lognote(domoticz, '     getHeatingTime: rad-to-room differential required is negative.  No heat required, returning zero water temp/heat %.')
+        return tWaterUse, pHeatPC
+    end
+    
+    -- calculate required water temperature to achieve the heating needed
+    local tWaterBase = tRR + tRoomMean                                      -- ideal water temperature (would require heating 100% of the time at this temperature)
+
+    -- now, does the boiler/heat source need some warm-up time?  (This is irrelevant and skipped if we're asking for more than max heat already)
+    if tSupply < tWaterBase and tWaterBase < params.tWaterMax then
+        -- apply the solution to a somewhat nasty quadratic equation to work out a new target water temp that allows for warm-up
+        lognote(domoticz, '    Boiler warm-up needed')
+        local hTotal = tWaterBase * temps.pTarget
+        local swp = tSupply + (params.rWarmUp * temps.pTarget)
+        local newTWB = swp - math.sqrt (swp^2 - (2 * hTotal * params.rWarmUp) - tSupply^2)
+        lognote(domoticz, 'hTotal=' .. hTotal .. ' swp=' .. swp .. ' rWarmUp=' .. params.rWarmUp .. ' pTarget=' .. temps.pTarget .. ' tSupply=' .. tSupply .. ' / Calc newTWB=' .. newTWB)
+        lognote(domoticz, 'Desired water temperature was ' .. tWaterBase .. '. Allowing for boiler warm-up, required temp is ' .. newTWB)
+        tWaterBase = newTWB
+    elseif tWaterBase < params.tWaterMax then
+        lognote(domoticz, 'Required supply temperature exceeds max available, so warm-up is not possible.')
+    else
+        lognote(domoticz, 'Heater supply temp currently ' .. tSupply .. ' so no warm-up required for target of ' .. tWaterBase)
+    end
+    local tWaterUse = math.floor(tWaterBase + 0.5 ,1)                       -- need an integer for the boiler; round up
+
+    -- if the water temperature isn't at usefully higher than target room temp, it's not going to achieve anything; how much higher differs by heating type and HW cylinder vs radiators, so is a parameter
+    if tWaterUse < temps.tRoomTarget + params.tWRDiffMin then
+        tWaterUse = temps.tRoomTarget + params.tWRDiffMin                   -- too small a difference; override it to minimum useful level
+    end
+
+    -- limit water temp requested to the available range
+    if tWaterUse > params.tWaterMax then
+        tWaterUse = params.tWaterMax
+    elseif tWaterUse < params.tWaterMin then
+        tWaterUse = params.tWaterMin
+    end
+
+    -- if we've varied the temperature from the ideal, then we need to vary the on-cycle percentage
+    -- NB, this is overly-precise; we're likely to be working with cycle periods of 10~30 minutes and boilers don't like being cycled on/off for less than about 5 minutes,
+    --  so whatever logic calls this function needs to take care of minimum on-times etc.
+    if tWaterUse ~= tWaterBase then
+        pHeatPC = math.floor((tWaterBase / tWaterUse * 100), 1)
+    else
+        pHeatPC = 100
+    end
+
+    -- if the heat-on percentage is <= 0, then we don't need to be heating at all
+    if pHeatPC <= 0 then
+        pHeatPC = 0
+        tWaterUse = 0
+    end
+    
+    lognote(domoticz, '     getHeatingTime calculations: tRoomMean=' .. tRoomMean .. ', tIBaseMin=' .. tIBaseMin .. ', tOutMean=' .. tOutMean .. ', tDecMin=' .. tDecMin .. ', tIncMin=' .. tIncMin .. ', tRR=' .. tRR .. ', tWaterBase=' .. tWaterBase .. ', tWaterUse=' .. tWaterUse .. ', pHeatPC=' .. pHeatPC .. ', tWRDiffMin=' .. params.tWRDiffMin)
+    return tWaterUse, pHeatPC
+    
+end -- getHeating Time
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+function getSetpoints (domoticz, setpointDeviceID)
+--
+-- Function to get the current and next setpoint values and next setpoint time from a setpoint device
+-- 
+-- NB! functions can't see the domoticz object unless it's passed in as a parameter!
+--
+-- Jeff T, 11/09/2020
+--
+    lognote(domoticz, '     getSetpoints: called for device idx' .. setpointDeviceID)
+
+    -- constants
+    DomoticzPort = 8080
+
+    -- initialise variables
+    local spURL=""
+    local spTable={}
+    local spCount=0
+    local i=0
+    local sp
+    local spts = {}
+    local hrs
+    local mins
+
+    -- time and date stuff
+    local Time = require('Time')
+    local currentTime = Time()
+    local dayToday = currentTime.wday - 1      -- dzVents uses Sun=1 whereas the domoticz timer data uses Mon=1
+    if dayToday == 0 then
+        dayToday = 7
+    end
+    local dayTomorrow = dayToday + 1
+    if dayTomorrow == 8 then
+        dayTomorrow = 1
+    end
+    local dayYesterday = dayToday - 1
+    if dayTomorrow == 0 then
+        dayTomorrow = 7
+    end
+    local bitToday = (1 << (dayToday-1))
+    local bitTomorrow = (1 << (dayTomorrow-1))
+    local bitYesterday = (1 << (dayYesterday-1))
+
+    local dateToday = currentTime.rawDate .. ' 00:00:00'
+    local startToday = Time(dateToday)      -- date part only, to add times to later
+    local startTomorrow = startToday.addMinutes(24*60)
+    local startYesterday = startToday.addMinutes(-24*60)
+
+    lognote(domoticz, 'bitToday=' .. bitToday .. ', bitTomorrow=' .. bitTomorrow .. ', bitYesterday=' .. bitYesterday)
+
+    -- Get a list of all timers for the specified device
+    -- local json = (loadfile "/home/domoticz/domoticz/scripts/lua/JSON.lua")()
+    local spURL = "curl 'http://127.0.0.1:" .. DomoticzPort .. "/json.htm?idx=" .. setpointDeviceID .. "&type=setpointtimers'"
+    lognote(domoticz, 'Setpoints:API call URL: <' .. spURL .. '>')
+    local handle = io.popen(spURL)
+    local setsAPI = handle:read('*all')
+    handle:close()
+    local spjson = json:decode(setsAPI)
+    lognote(domoticz, 'API call status = ' .. spjson.status)
+    
+    -- API error and nil result traps
+    if spjson.status ~= 'OK' then
+        domoticz.log('#### getSetpoints: API call failed for device idx ' .. setpointDeviceID, domoticz.LOG_WARN)
+        return nil, nil, nil
+    end
+    if spjson.result == nil then
+        domoticz.log('#### getSetpoints: No setpoints returned for device idx ' .. setpointDeviceID, domoticz.LOG_WARN)
+        return nil, nil, nil
+    end
+    
+    -- Now iterate through the setpoints array and create a reduced set covering only active fixed-time setpoints applicable to yesterday, today and tomorrow
+    -- domoticz is unhelpful with the 'days' value - it's not a simple 7-bit mask; 1,2,...64 are Mo-Su but then 128=every day, 256=weekdays, 512=weekends!  So, we have to expand the last three values into multiple records for the days we care about.
+    for i, sp in ipairs(spjson.result) do
+        if (sp.Active == "true" or sp.Active == "True") and sp.Type == 2 then    -- active and a useable timer type
+            hrs = tonumber(string.sub(sp.Time,1,2))
+            mins = tonumber(string.sub(sp.Time,4,5))
+            if sp.Days == bitYesterday or sp.Days == 128 or (sp.Days == 256 and dayYesterday <= 5) or (sp.Days == 512 and dayYesterday >= 6) then      -- yesterday matches
+                -- construct a datetime value for the setpoint and use that instead of the day in our set
+                lognote(domoticz, 'Eligible setpoint for yesterday: Days ' .. sp.Days .. ', hr ' .. hrs .. ', min ' .. mins .. ', temp ' .. sp.Temperature)
+                spts = startYesterday.addMinutes(hrs * 60 + mins)
+                spCount=spCount+1   -- increment first as LUA likes 1-indexed arrays
+                spTable[spCount] = {TrigTime = spts, Temperature = sp.Temperature}
+            end
+            if sp.Days == bitToday or sp.Days == 128 or (sp.Days == 256 and dayToday <= 5) or (sp.Days == 512 and dayToday >= 6) then      -- today matches
+                -- construct a datetime value for the setpoint and use that instead of the day in our set
+                lognote(domoticz, 'Eligible setpoint for today: Days ' .. sp.Days .. ', hr ' .. hrs .. ', min ' .. mins .. ', temp ' .. sp.Temperature)
+                spts = startToday.addMinutes(hrs * 60 + mins)
+                spCount=spCount+1   -- increment first as LUA likes 1-indexed arrays
+                spTable[spCount] = {TrigTime = spts, Temperature = sp.Temperature}
+            end
+            if sp.Days == bitTomorrow or sp.Days == 128 or (sp.Days == 256 and dayTomorrow <= 5) or (sp.Days == 512 and dayTomorrow >= 6) then      -- tomorrow matches
+                -- construct a datetime value for the setpoint and use that instead of the day in our set
+                lognote(domoticz, 'Eligible setpoint for tomorrow: Days ' .. sp.Days .. ', hr ' .. hrs .. ', min ' .. mins .. ', temp ' .. sp.Temperature)
+                spts = startTomorrow.addMinutes(hrs * 60 + mins)
+                spCount=spCount+1   -- increment first as LUA likes 1-indexed arrays
+                spTable[spCount] = {TrigTime = spts, Temperature = sp.Temperature}
+            end
+        end
+    end
+    domoticz.log('     getSetpoints: identified ' .. spCount .. ' setpoints for today and tomorrow.', domoticz.LOG_INFO)
+    
+    -- Check our new array; find the earliest setpoint whose timestamp is greater than the current time and no later than the end of tomorrow
+    local nextTime = startTomorrow.addMinutes(24 * 60)
+    local nextTemp = nil
+    local nextMins = nil
+    local schedTemp = nil
+    local schedTime = startYesterday
+    lognote(domoticz, 'Start yesterday = ' .. startYesterday.dDate .. ', start today = ' .. startToday.dDate .. ', nextTime starts search = ' .. nextTime.dDate .. ', currentTime = ' .. currentTime.dDate)
+
+    for i, sp in ipairs(spTable) do
+        lognote(domoticz, 'Setpoint ' .. sp.TrigTime.dDate .. ' / ' .. sp.TrigTime.rawDate .. 'T' .. sp.TrigTime.rawTime .. ', ' .. sp.Temperature)
+        if sp.TrigTime.dDate > currentTime.dDate and sp.TrigTime.dDate < nextTime.dDate then
+            lognote(domoticz, '... Taken as next SP')
+            nextTime = sp.TrigTime
+            nextTemp = sp.Temperature
+        end
+        if sp.TrigTime.dDate <= currentTime.dDate and sp.TrigTime.dDate > schedTime.dDate then
+            lognote(domoticz, '... Taken as current scheduled SP')
+            schedTime = sp.TrigTime
+            schedTemp = sp.Temperature
+        end
+    end
+    if schedTemp == nil then
+        domoticz.log('#### getSetpoints: Did not find a valid current setpoint!', domoticz.LOG_WARN)
+    end
+    if nextTemp == nil then
+        domoticz.log('#### getSetpoints: Did not find any valid future setpoint today or tomorrow!', domoticz.LOG_WARN)
+    end
+    -- calculate next setpoint time as a number of minutes from now
+
+    if nextTemp ~= nil then
+        local compres = currentTime.compare(nextTime)
+        if compres.compare >= 0 then
+            nextMins = compres.minutes
+        else
+            nextMins = 0
+        end
+    else
+        nextMins = nil
+    end
+    lognote(domoticz, '     getSetpoints: Next setpoint to be used is ' .. tostring(nextTemp) .. ' degrees in ' .. tostring(nextMins) .. ' minutes at ' .. nextTime.rawDate .. 'T' .. nextTime.rawTime .. ' ; current scheduled and actual setpoint values are ' .. tostring(schedTemp) .. ' and ' .. domoticz.devices(setpointDeviceID).setPoint, domoticz.LOG_INFO)
+    return domoticz.devices(setpointDeviceID).setPoint, nextTemp, nextMins, schedTemp
+
+end -- getSetpoints
+
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+function getZoneTemperature(domoticz, sensorIdx, maxAge)
+--
+-- Return current temperature of a zone, or nil if it's invalid
+-- This is simple, but I've abstracted it into a function to allow for error trapping and any future complexity such as using groups of sensors
+--
+-- Jeff T, 14/09/2020
+--
+
+    if sensorIdx == nil then
+        domoticz.log('#### getZoneTemperature was passed a nil sensorIdx!', domoticz.LOG_WARN)
+        return nil
+    end
+
+    lognote(domoticz, '     Fetching zone temperature from sensor idx ' .. tostring(sensorIdx))
+    if domoticz.devices(sensorIdx).idx == nil then
+        domoticz.log('#### Sensor device idx ' .. sensorIdx .. ' does not exist!', domoticz.LOG_WARN)
+        return nil
+    end
+    
+    local v = domoticz.devices(sensorIdx).temperature
+    if v == nil or v > 99 or v == 0.0 or domoticz.devices(sensorIdx).lastUpdate.minutesAgo > maxAge then
+        -- implausible value or outdated data
+        if v == nil then
+            v = 'nil'
+        end
+        domoticz.log('     Sensor idx ' .. sensorIdx .. ' is showing implausible or outdated data!  [' .. v .. ' deg, ' .. tostring(domoticz.devices(sensorIdx).lastUpdate.minutesAgo) .. ' minutes ago]')
+        v = nil
+    end
+    return v
+end
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+function getOutdoorTemperature(domoticz, sensor, nextTime, maxAge)
+--
+-- Return current outdoor temperature and predicted temperature after nextTime minutes, or nil if no valid data
+--
+-- Jeff T, 14/09/2020
+-- 11/10/20 - added facility for 4 hours of forward forecast temperatures
+
+    if sensor == nil then
+        domoticz.log('getOutdoorTemperature was passed a nil sensor reference!', domoticz.LOG_WARN)
+        return nil, nil
+    end
+    local stemp = domoticz.variables('Heating sensor ' .. sensor).value
+    if stemp == nil then
+        domoticz.log('getOutdoorTemperature: no user variable Heating sensor ' .. sensor .. ' !', domoticz.LOG_WARN)
+        return nil, nil
+    end
+    -- local jsonl = (loadfile "/home/domoticz/domoticz/scripts/lua/JSON.lua")()
+    local sensorData = json:decode(stemp)
+    if sensorData == nil then
+        domoticz.log('getOutdoorTemperature: no sensor data in uservar for reference ' .. sensor .. ' !', domoticz.LOG_WARN)
+        return nil, nil
+    end
+
+    lognote(domoticz, 'Fetching current outdoor temperature from sensor Idx ' .. sensor)
+    if domoticz.devices(sensorData.idxNow) == nil then
+        domoticz.log('Sensor device idx ' .. sensorIdx .. ' does not exist!', domoticz.LOG_WARN)
+        return nil
+    end
+    
+    -- current temperature
+    local now = domoticz.devices(sensorData.idxNow).temperature
+    if now == nil or now > 99 or domoticz.devices(sensorData.idxNow).lastUpdate.minutesAgo > maxAge then
+        -- implausible value or outdated data
+        if now == nil then
+            now = 'nil'
+        end
+        domoticz.log('Sensor idx ' .. sensorData.idxNow .. ' is showing implausible or outdated data!  [' .. now .. ' deg, ' .. tostring(domoticz.devices(sensorData.idxNow).lastUpdate.minutesAgo) .. ' minutes ago]')
+        now = nil
+    end
+
+    -- temperature at nextTime
+    local next
+    if nextTime <= 30 then
+        next = now
+    elseif nextTime <= 90 then
+        next = domoticz.devices(sensorData.idx1).temperature
+    elseif nextTime <= 150 then
+        next = domoticz.devices(sensorData.idx2).temperature
+    elseif nextTime <= 210 then
+        next = domoticz.devices(sensorData.idx3).temperature
+    else
+        next = domoticz.devices(sensorData.idx4).temperature
+    end
+    if next == nil then
+        domoticz.log('Next temperature for sensor ' .. sensor .. ' for ' .. nextTime .. ' minutes ahead is nil!', domoticz.LOG_WARN)
+    end
+
+    lognote(domoticz, 'Sensor ' .. sensor .. ' returning now=' .. now .. ' and next for ' .. nextTime .. ' mins ahead=' .. next)
+    return now, next
+end
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+function heatingControl (domoticz, trig)
+--
+-- Main heating control function, called by the dzVents event block
+--
+-- CHANGE LOG:
+--  11/10/20 - Jeff - added master + local valve capability and valve type definitions
+--
+	domoticz.log('#### Heating control', domoticz.LOG_INFO)
+	
+    json = (loadfile "/home/domoticz/domoticz/scripts/lua/JSON.lua")()      -- let this be global so that the called functions can use it
+
+	-- constants
+--	pCycleTime = 15
+
+	-- local variables
+    local globalParams = {}
+    local params = {}
+    local temps = {}
+    local x = 0
+    local tWaterMaxDemand = 0
+    local zone, i, v
+    local tFlow, tReturn
+
+	-- date & time stuff
+    local Time = require('Time')
+    local now = Time()
+	
+    -- load global parameters for heat source/system from user variable 'Heating control global'
+    local tempData = {}
+    if domoticz.variables('Heating control global') == nil then
+        domoticz.log('heatingControl: no user variable <Heating control global>!  Unable to work without this.', domoticz.LOG_WARN)
+        return
+    end
+    tempData = json:decode(domoticz.variables('Heating control global').value)
+    local pCycleTime = tempData.cycleTime
+    local tWaterMin = tempData.heaterMinTemp
+    local tWaterMax = tempData.heaterMaxTemp
+    local pBoilerOnMin = tempData.heaterMinOntime
+    local iFlow = tempData.idxFlowTemp
+    local iReturn = tempData.idxReturnTemp
+    local rWarmUp = tempData.warmUpRate
+    local iBFSP = tempData.flowSet
+    
+    if pCycleTime == nil then
+        domoticz.log('heatingControl: no cycleTime defined in user variable <Heating control global>!  Unable to work without this.', domoticz.LOG_WARN)
+        return
+    end
+    if tWaterMin == nil then
+        domoticz.log('heatingControl: no heaterMinTemp defined in user variable <Heating control global>!  Unable to work without this.', domoticz.LOG_WARN)
+        return
+    end
+    if tWaterMax == nil then
+        domoticz.log('heatingControl: no HeaterMaxTemp defined in user variable <Heating control global>!  Unable to work without this.', domoticz.LOG_WARN)
+        return
+    end
+    if pBoilerOnMin == nil then
+        domoticz.log('heatingControl: no heaterMinOntime defined in user variable <Heating control global>!  Unable to work without this.', domoticz.LOG_WARN)
+        return
+    end
+    if iFlow == nil then
+        domoticz.log('heatingControl: no idxFlowTemp defined in user variable <Heating control global>!  Unable to work without this.', domoticz.LOG_WARN)
+        return
+    end
+    if iReturn == nil then
+        domoticz.log('heatingControl: no idxReturnTemp defined in user variable <Heating control global>!  Unable to work without this.', domoticz.LOG_WARN)
+        return
+    end
+    if rWarmUp == nil then
+        domoticz.log('heatingControl: no warmUpRate defined in user variable <Heating control global>!  Unable to work without this.', domoticz.LOG_WARN)
+        return
+    end
+
+    -- get the current state of play with the heat source's flow and return temperatures (may be the same if it's not a wet system)
+    tFlow = domoticz.devices(iFlow).temperature
+    tReturn = domoticz.devices(iReturn).temperature
+
+
+    -- each zone is defined as a JSON string in a user variable, with this format: {sensor: 5, setpoint: 1; valve: 8; incRate: 0.3; decRate: 0.2; outSensor: 10; prefPHT: 30; maxPHT: 120; minDT: 10, hyst: 0.5}
+    -- incRate is 1000 * increase degC/min/degC water-to-zone diff; decRate is 1000 * decrease degC/min/degC of zone-outdoor diff; prefPHT, maxPHT = preferred, max pre-heat periods; minDT = minimum useful water-to-zone diff; hyst = hysteresis on target temps.
+
+    -- load heating zone data from user vars (dzVents's approach to iterating through these is a bit strange; they're not just a list)
+    local zoneData = {}
+    local junk = domoticz.variables().filter(function(v)
+        if string.find(v.name, 'Heating zone ') then
+            lognote(domoticz, 'Found a zone definition: ' .. v.name .. ' // ' .. v.value)
+            zoneData[v.name] = json:decode(v.value)
+            zoneData[v.name].name = string.sub(v.name, 13)                      -- remove the 'Heating zone ' prefix
+            zoneData[v.name].incRate = zoneData[v.name].incRate / 1000          -- these are stored * 1000 to avoid a load of leading zeroes for the user and over-length domoticz user variables
+            zoneData[v.name].decRate = zoneData[v.name].decRate / 1000
+        end
+    end)
+    -- now, we have a simple list of objects zoneData, containing our zones
+    -- we can also add new elements to each entry by simply assigning - e.g. zoneData[i].newItem='hi!' - which we'll use to record more zone data and calculations as we go along
+
+    -- now, we will process each of the zones to see what heat it needs
+    for i,zone in pairs(zoneData) do
+        domoticz.log('#### Heating control: first pass processing for zone ' .. tostring(zone.name))
+        lognote(domoticz, '     sensorIdx=' .. tostring(zone.sensor) .. ' setpointIdx=' .. tostring(zone.setpoint) .. ' valve=' .. tostring(zone.valve) .. ' outSensorIdx=' .. tostring(zone.outSensor))
+
+        -- get setpoints now, next; add them to zoneData
+        zone.currentSP, zone.nextSP, zone.nextTime, zone.scheduledSP = getSetpoints(domoticz, zone.setpoint)
+        
+        -- get current and predicted zone temperatures; add them to zoneData
+        zone.currentTemp = getZoneTemperature(domoticz, zone.sensor, zone.age)
+        if zone.currentTemp == nil then
+            -- zone has no valid temperature data; we will have to ignore it
+            domoticz.log('#### No valid indoor temperature data for zone ' .. zone.name .. '.  Temperatures will be set to 99 to avoid heating.', domoticz.LOG_WARN)
+            zone.currentTemp = 99
+        end
+
+        -- get current and predicted outdoor temperatures; add them to zoneData
+        zone.currentOutdoor, zone.nextOutdoor = getOutdoorTemperature(domoticz, zone.outSensor, zone.nextTime, zone.age)
+        if zone.currentOutdoor == nil then
+            -- zone has no valid temperature data; we will have to ignore it
+            domoticz.log('#### No valid current outdoor temperature data for zone ' .. zone.name .. '.  Temperatures will be set to indoor temp. as default.', domoticz.LOG_WARN)
+            zone.currentOutdoor = zone.currentTemp
+        end
+        if zone.nextOutdoor == nil then
+            -- zone has no valid temperature data; we will have to ignore it
+            domoticz.log('#### No valid predicted outdoor temperature data for zone ' .. zone.name .. '.  Will be set to same as current.', domoticz.LOG_WARN)
+            zone.nextOutdoor = zone.currentOutdoor
+        end
+        domoticz.log('     Zone ' .. zone.name .. ': currentTemp ' .. tostring(zone.currentTemp) .. ', currentSP ' .. tostring(zone.currentSP) .. ', nextSP ' .. tostring(zone.nextSP) .. ', after ' .. tostring(zone.nextTime) .. ', maxPHT ' .. tostring(zone.maxPHT) .. ', prefPHT ' .. tostring(zone.prefPHT) .. ', currentOutdoor ' .. tostring(zone.currentOutdoor) .. ', nextOutdoor ' .. tostring(zone.nextOutdoor))
+
+        -- calculate heating requirement (first pass for current SP) -> record % on time and desiredWaterTempCurrent
+        lognote(domoticz, 'Checking current setpoint heat requirement...')
+        if zone.currentTemp ~= 99 then
+            params = {rDecrease = zone.decRate, rIncrease = zone.incRate, tWaterMin =  tWaterMin, tWaterMax = tWaterMax, tWRDiffMin = zone.minDT, hysteresis = zone.hyst, rWarmUp = rWarmUp, tFlow = tFlow, tReturn = tReturn}
+            temps = {tRoomNow = zone.currentTemp, tRoomTarget = zone.currentSP, pTarget = pCycleTime, tOutNow = zone.currentOutdoor, tOutPredict = zone.currentOutdoor}
+            zone.waterNow, zone.heatNow = getHeatingTime (domoticz, temps, params)
+            if zone.waterNow < 0 or zone.heatNow < 0 then
+                zone.waterNow = 0
+                zone.heatNow = 0
+            end
+        else    -- temperature 99 => bad data, don't bother
+            zone.waterNow = 0
+            zone.heatNow = 0
+        end
+        lognote(domoticz, 'Current SP called for ' .. zone.waterNow .. 'deg / ' .. zone.heatNow .. '%')
+        
+        -- if this setpoint requires hotter water than any before it, update the required water temperature
+        if zone.waterNow > tWaterMaxDemand then
+            tWaterMaxDemand = zone.waterNow
+        end
+
+        -- calculate heating requirement (first pass for next SP) -> record % on time and desiredWaterTempNow
+        -- if setpoint is too far away, set zoneData[i].handleNext to false, else true
+        -- Note; no hysteresis on future setpoints as we're not trying to ignore slight variations, we're aiming to hit a target
+        lognote(domoticz, 'Checking next SP heat requirement...')
+        if zone.nextTime > zone.maxPHT then
+            zone.waterNext = 0
+            zone.heatNext = 0
+            domoticz.log('     Next setpoint too far away at present, ' .. zone.nextTime .. ' mins.')
+        elseif zone.currentTemp ~= 99 then
+            -- try with the lesser of time to setpoint and preferred pre-heating time
+            zone.PHT = math.min(zone.nextTime, zone.prefPHT)
+            params = {rDecrease = zone.decRate, rIncrease = zone.incRate, tWaterMin =  tWaterMin, tWaterMax = tWaterMax, tWRDiffMin = zone.minDT, hysteresis = 0, rWarmUp = rWarmUp, tFlow = tFlow, tReturn = tReturn}
+            temps = {tRoomNow = zone.currentTemp, tRoomTarget = zone.nextSP, pTarget = zone.PHT, tOutNow = zone.currentOutdoor, tOutPredict = zone.nextOutdoor}
+            zone.waterNext, zone.heatNext = getHeatingTime (domoticz, temps, params)
+            if zone.heatNext == 0 or zone.waterNext == 0 then
+                zone.waterNext = 0
+                zone.heatNext = 0
+                zone.PHT = 0
+                lognote(domoticz, 'No heat required')
+            elseif zone.heatNext > 100 then
+                if zone.PHT == zone.nextTime then
+                    -- we tried for the time to setpoint and missed; all we can do is heat at 100% full-time
+                    zone.heatNext = 100
+                    lognote(domoticz, 'Cannot heat enough by next SP; will use 100%')
+                else
+                    -- we tried with the pref. pre-heat time and missed; can we hit setpoint using a longer time?
+                    x = zone.PHT * zone.heatNext / 100
+                    lognote(domoticz, 'PrefPHT or time to next SP insufficient. Need ' .. x .. ' mins')
+                    if x > zone.maxPHT then
+                        -- can't make it within the max pre-heat time, so we have to go for 100% full-time
+                        zone.heatNext = 100
+                        zone.PHT = zone.maxPHT
+                    else
+                        -- can make it in some time between pref. and max; we'll take the shortest possible pre-heat time at 100% rather than reduce the cycle or temperature as we don't like pre-heating too early
+                        zone.heatNext = 100
+                        zone.PHT = x
+                    end
+                    lognote(domoticz, 'Preferred PHT not enough; using ' .. zone.PHT .. ' mins.')
+                end
+            --else, all's fine and lovely
+            end
+        else    -- temperature 99 => bad data, don't bother
+            zone.waterNext = 0
+            zone.heatNext = 0
+            zone.PHT = zone.maxPHT
+            lognote(domoticz, 'Bad data!')
+        end -- if..zone.nextTime
+        if zone.PHT == nil then
+            zone.PHT = 0
+        end
+        lognote(domoticz, '     Next SP wants water @ ' .. zone.waterNext .. ' / ' .. zone.heatNext .. '% for ' .. zone.PHT .. ' mins')
+
+        -- do we need to heat yet?
+        if zone.nextTime - zone.PHT > pCycleTime then
+            domoticz.log('     Zone ' .. zone.name .. ' next setpoint needs pre-heating for ' .. zone.PHT .. ' minutes; no heat needed yet as setpoint is ' .. zone.nextTime .. ' minutes away.')
+            zone.waterNext = 0
+            zone.heatNext = 0
+        end
+        
+        -- if this setpoint requires hotter water than any before it, update the required water temperature
+        if zone.waterNext > tWaterMaxDemand then
+            tWaterMaxDemand = zone.waterNext
+        end
+    end -- for..zoneData
+    
+    if tWaterMaxDemand == nil or tWaterMaxDemand < tWaterMin then
+        -- no zone needed any heat
+        tWaterMaxDemand = 0
+        domoticz.log('#### Heating control: no zone requires any heat at present.')
+    else
+        -- at this point, we have tWaterMaxDemand and can recalculate those zones still in consideration using that water temperature
+        domoticz.log('#### Heating control: re-calculating on-times for zones that need heat, using water temperature ' .. tWaterMaxDemand)
+        for i,zone in pairs(zoneData) do
+            if zone.waterNow > 0 then   -- zone needs heat
+                -- recalculate heating requirement (current SP) using tWaterMaxDemand
+                params = {rDecrease = zone.decRate, rIncrease = zone.incRate, tWaterMin =  tWaterMaxDemand, tWaterMax = tWaterMaxDemand, tWRDiffMin = zone.minDT, hysteresis = zone.hyst, rWarmUp = rWarmUp, tFlow = tFlow, tReturn = tReturn}
+                temps = {tRoomNow = zone.currentTemp, tRoomTarget = zone.currentSP, pTarget = pCycleTime, tOutNow = zone.currentOutdoor, tOutPredict = zone.currentOutdoor}
+                zone.waterNow, zone.heatNow = getHeatingTime (domoticz, temps, params)
+    
+                -- as this is the current setpoint, the most it can want is 100% heating; it can't have the on-time extended to help
+                -- if heat % exceeds 100%, the water temperature will already be at max value; we've no way to meet the target in time
+                if zone.heatNow > 100 then
+                    domoticz.log('     Zone ' .. zone.name .. ' current setpoint requirement of ' .. tostring(zone.currentSP) .. ' requires more than 100% on-time; cannot be achieved within one cycle!')
+                    zone.heatNow = 100
+                else
+                    domoticz.log('     Zone ' .. zone.name .. ' current setpoint requirement of ' .. tostring(zone.currentSP) .. ' requires ' .. tostring(zone.heatNow) .. '% on-time at ' .. tWaterMaxDemand .. ' degrees')
+                end
+            end -- if..zone.waterNow
+        
+            -- recalculate heating requirement (next SP) using tWaterMaxDemand
+            if zone.waterNext > 0 then  -- zone needs heat
+                params = {rDecrease = zone.decRate, rIncrease = zone.incRate, tWaterMin =  tWaterMaxDemand, tWaterMax = tWaterMaxDemand, tWRDiffMin = zone.minDT, hysteresis = 0, rWarmUp = rWarmUp, tFlow = tFlow, tReturn = tReturn}
+                temps = {tRoomNow = zone.currentTemp, tRoomTarget = zone.nextSP, pTarget = zone.PHT, tOutNow = zone.currentOutdoor, tOutPredict = zone.nextOutdoor}
+                zone.waterNext, zone.heatNext = getHeatingTime (domoticz, temps, params)
+     
+                -- if heat % exceeds 100%, we can't make it in the time available
+                if zone.heatNext > 100 then
+                    if zone.PHT == zone.nextTime then
+                        -- we tried for the time to setpoint and missed; all we can do is heat at 100% full-time
+                        x = zone.heatNext
+                        zone.heatNext = 100
+                    else
+                        -- we tried with the pref. pre-heat time and missed; can we hit setpoint using a longer time?
+                        x = zone.PHT * zone.heatNext / 100
+                        if x  > zone.maxPHT then
+                            -- can't make it within the max pre-heat time, so we have to go for 100% full-time
+                            zone.heatNext = 100
+                            zone.PHT = zone.maxPHT
+                        else
+                            -- can make it in some time between pref. and max; we'll take the shortest possible pre-heat time at 100% rather than reduce the cycle or temperature as we don't like pre-heating too early
+                            zone.heatNext = 100
+                            zone.PHT = x * zone.prefPHT
+                        end
+                    end
+                    if x > 100 then
+                        domoticz.log('     Zone ' .. zone.name .. ' next setpoint requirement of ' .. tostring(zone.nextSP) .. ' in ' .. (zone.nextTime) .. ' minutes requires more than 100% on-time; cannot be achieved!')
+                    else
+                        domoticz.log('     Zone ' .. zone.name .. ' next setpoint requirement of ' .. tostring(zone.currentSP) .. ' in ' .. tostring(zone.nextTime) .. ' minutes requires ' .. zone.heatNow .. '% on-time at ' .. tWaterMaxDemand .. ' degrees')
+                    end
+                end -- if..zone.heatNext
+    
+                -- if the zone doesn't need to start pre-heating yet for its next setpoint, ignore that SP for now
+                if zone.nextTime - zone.PHT < pCycleTime then
+                    domoticz.log('     Zone ' .. zone.name .. ' next setpoint needs pre-heating for ' .. zone.PHT .. ' minutes; no heat needed yet as setpoint is ' .. zone.nextTime .. ' minutes away.')
+                    zone.waterNext = 0
+                    zone.heatNext = 0
+                end
+            end -- if..zone.waterNext
+        end -- for..zoneData
+    end  -- if.. tWaterMaxDemand nil or low
+
+    -- we now know our heating requirements: tWaterMaxDemand is our water temperature; the on-time % for each zone valve is the max of the 'heatNow' and 'heatNext' values for all zones using that valve
+    -- first, form a list of valves and record the max on-time % against each valve
+    local valves = {}
+    for i,zone in pairs(zoneData) do
+
+        -- master valve
+        v = zone.mvalve
+        lognote(domoticz, '     Processing master valve for zone ' .. zone.name .. ' - heatNow = ' .. zone.heatNow .. ', heatNext = ' .. zone.heatNext .. ', valve = ' .. tostring(v))
+        if v ~= nil then  -- zone has a master valve
+            if valves == nil or valves[v] == nil then       -- no record for this valve yet; create one
+                valves[v] = {heatMax = 0, tempTarget = 0}
+                lognote(domoticz, '   new valve record')
+            end
+
+            -- check current and next SPs to determine valve % on and setpoint temperature
+            valves[v].heatMax = math.max(valves[v].heatMax, zone.heatNow, zone.heatNext) 
+            if zone.heatNow == 0 and zone.heatNext ~= 0 then
+                valves[v].tempTarget = math.max(valves[v].tempTarget, zone.nextSP)
+            elseif zone.heatNow ~= 0 and zone.heatNext == 0 then
+                valves[v].tempTarget = math.max(valves[v].tempTarget, zone.currentSP)
+            elseif zone.heatNow ~= 0 and zone.heatNext ~= 0 then
+                valves[v].tempTarget = math.max(valves[v].tempTarget, zone.currentSP, zone.nextSP)
+            -- else neither current nor next SP wants any heat, in which case we shouldn't have got here!
+            end
+            lognote(domoticz, '    Valve will use heatMax=' .. valves[v].heatMax .. ' and tempTarget ' .. valves[v].tempTarget)
+        end -- master valve handler
+
+        -- local valve
+        v = zone.valve
+        lognote(domoticz, '     Processing local valve for zone ' .. zone.name .. ' - heatNow = ' .. zone.heatNow .. ', heatNext = ' .. zone.heatNext .. ', valve = ' .. tostring(v))
+        if v ~= nil then  -- zone has a local valve
+            if valves == nil or valves[v] == nil then       -- no record for this valve yet; create one
+                valves[v] = {heatMax = 0, tempTarget = 0}
+                lognote(domoticz, '   new valve record')
+            end
+
+            -- check current and next SPs to determine valve % on and setpoint temperature
+            valves[v].heatMax = math.max(valves[v].heatMax, zone.heatNow, zone.heatNext) 
+            if zone.heatNow == 0 and zone.heatNext ~= 0 then
+                valves[v].tempTarget = math.max(valves[v].tempTarget, zone.nextSP)
+            elseif zone.heatNow ~= 0 and zone.heatNext == 0 then
+                valves[v].tempTarget = math.max(valves[v].tempTarget, zone.currentSP)
+            elseif zone.heatNow ~= 0 and zone.heatNext ~= 0 then
+                valves[v].tempTarget = math.max(valves[v].tempTarget, zone.currentSP, zone.nextSP)
+            -- else neither current nor next SP wants any heat, in which case we shouldn't have got here!
+            end
+            lognote(domoticz, '    Valve will use heatMax=' .. valves[v].heatMax .. ' and tempTarget ' .. valves[v].tempTarget)
+
+        end -- local valve handler
+    end -- for... zoneData
+
+    if valves == nil then  
+        domoticz.log('    Oops!  We created no valve records!  Exiting.', domoticz.LOG_WARN)
+        return
+    end
+
+    -- now, convert to minutes, find the lowest of the valve on-times and adjust it if it's below the boiler's minimum on-time
+    local lowest = 0
+    local lowestidx = 0
+    for i,v in pairs(valves) do
+        v.onTime = v.heatMax * pCycleTime / 100
+        lognote(domoticz, '    Valve ' .. i .. ' needs to be on for ' .. tostring(v.heatMax) .. '% / ' .. v.onTime .. ' minutes for set temp ' .. v.tempTarget)
+        if lowest == 0 or (v.onTime < lowest and v.onTime > 0) then
+            lowest = v.onTime
+            lowestidx = i
+        end
+    end -- for..valves
+    if lowest == 0 then     -- this shouldn't happen as it's trapped earlier using the water temperatures, but just in case...
+        domoticz.log('     No zone requires heat.')
+        tWaterMaxDemand = 0
+    elseif lowest < pBoilerOnMin then
+        domoticz.log('     Overriding shortest on-time of ' .. lowest .. ' for valve ' .. lowestidx .. ' to heat source minimum of ' .. pBoilerOnMin)
+        valves[lowestidx].onTime = pBoilerOnMin
+        -- the remaining zones are okay as they are; we just need one zone on so that the boiler stays on for its minimum period
+    end
+
+    -- now we know what we need to do, let's go set the system controls to do it!
+
+    -- clear valve command queues, assert new state, queue up 'off' commands for later if needed
+    local valveDef, vtmp
+    for  i,v in pairs(valves) do
+        -- get the valve definition
+        if domoticz.variables('Heating valve ' .. i) == nil then
+            domoticz.log('No valve definition found for ' .. i .. '. Should be user variable <Heating valve ' .. i .. '>', domoticz.LOG_WARN)
+        else
+            vtmp = domoticz.variables('Heating valve ' .. i).value
+            lognote(domoticz, 'Valve ' .. i .. ' / uservar value=' .. vtmp)
+            valveDef = json:decode(vtmp)
+    
+            if v.onTime > 0 then
+                domoticz.log('     Setting valve ' .. i .. ' on for ' .. v.onTime .. ' minutes.')
+                -- how we set the valve 'on' depends on its definition
+                -- valve defs have 4 attributes: idxOnOff, idxPercent, idxMode, idxSetpoint - any can be populated; we will process all that are; also 'strModeOn', 'strModeOff' for the heating mode
+                -- this allows for 'smart' TRVs that need telling in several different ways to do something!
+                if valveDef.idxOnOff ~= nil then
+                    lognote(domoticz, '     Valve has an on/off aspect. Setting ON.')
+                    domoticz.devices(valveDef.idxOnOff).cancelQueuedCommands()
+                    domoticz.devices(valveDef.idxOnOff).switchOn()
+                    domoticz.devices(valveDef.idxOnOff).switchOff().afterMin(v.onTime)
+                end
+                if valveDef.idxPercent ~= nil then
+                    lognote(domoticz, '     Valve has a % aspect. Setting 100.')
+                    domoticz.devices(valveDef.idxPercent).cancelQueuedCommands()
+                    domoticz.devices(valveDef.idxPercent).setLevel(100)
+                    domoticz.devices(valveDef.idxPercent).setLevel(0).afterMin(v.onTime)
+                end
+                if valveDef.idxMode ~= nil then
+                    lognote(domoticz, '     Valve has a mode aspect. Setting ' .. valveDef.strModeOn)
+                    domoticz.devices(valveDef.idxMode).cancelQueuedCommands()
+                    domoticz.devices(valveDef.idxMode).updateMode(valveDef.strModeOn)
+                    domoticz.devices(valveDef.idxMode).updateMode(valveDef.strModeOff).afterMin(v.onTime)
+                end
+                if valveDef.idxSetpoint ~= nil then
+                    lognote(domoticz, '     Valve has an setpoint aspect. Setting ' .. v.tempTarget)
+                    domoticz.devices(valveDef.idxSetpoint).cancelQueuedCommands()
+                    domoticz.devices(valveDef.idxSetpoint).updateSetPoint(v.tempTarget)
+                    -- no need to reset the setpoint after heating, as it's still correct
+                end
+            else
+                domoticz.log('     Setting valve ' .. i .. ' off.')
+                if valveDef.idxOnOff ~= nil then
+                    lognote(domoticz, '     Valve has an on/off aspect.')
+                    domoticz.devices(valveDef.idxOnOff).switchOff()
+                end
+                if valveDef.idxPercent ~= nil then
+                    lognote(domoticz, '     Valve has a percent aspect.')
+                    domoticz.devices(valveDef.idxPercent).setLevel(0)
+                end
+                if valveDef.idxMode ~= nil then
+                    lognote(domoticz, '     Valve has an mode aspect.')
+                    domoticz.devices(valveDef.idxMode).updateMode(valveDef.strModeOff)
+                end
+                -- no need to reset the setpoint as it's still correct
+            end     -- if v.onTime
+        end     -- if uservar not nil
+    end     -- for..valves
+
+    -- assert boiler flow temperature
+    if tWaterMaxDemand >= tWaterMin and tWaterMaxDemand > 0 then
+        domoticz.log('     Setting boiler flow temperature to ' .. tWaterMaxDemand)
+        domoticz.devices(iBFSP).cancelQueuedCommands()
+        domoticz.devices(iBFSP).updateSetPoint(tWaterMaxDemand)
+    else
+        domoticz.devices(iBFSP).cancelQueuedCommands()
+        -- no need to set a temperature if we're not calling for heat; the boiler will revert to the panel control setting soon anyway
+    end
+    domoticz.log('#### Heating control: my work here is done, for now!')		
+
+end -- heatingcontrol
+
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- main event code block
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+return {
+	on = {
+		timer = {
+			'every 15 minutes'
+		},
+        devices = {
+            'HW setpoint lower sensor', 
+            'HW setpoint upper sensor',
+            'CH setpoint hall',
+            'CH setpoint landing',
+            'CH setpoint kitchen',
+            'CH setpoint study',
+            'CH setpoint Myles',
+        },
+	},
+    data = {
+        heatingAlgoLock = { initial = false }         -- flag to avoid the routine re-triggering itself when changing setpoints
+    },
+	execute = function (domoticz, trig)
+
+
+        -- Check that the heating algo isn't already running
+        if heatingAlgoLock then
+            return
+        end
+        -- Now set the lock to avoid the routine triggering itself by changing setpoints or other devices
+        heatingAlgoLock = true
+        
+        -- Check the (virtual) boiler master switches
+
+        -- Service mode switch - stops any automatic interference with the controls
+        if domoticz.devices('Boiler manual / service').state == 'On' then
+            domoticz.log('#### Heating control: boiler manual / service switch is ON. No action.')
+            return
+        end
+        -- Master on/off switch
+	    if domoticz.devices('Boiler master').state ~= 'On' then
+	        domoticz.log('#### Heating control: boiler master switch is OFF. Switching off boiler relays.')
+	        domoticz.devices('Boiler relay - hot water').switchOff()
+	        domoticz.devices('Boiler relay - heating').switchOff()
+	        return
+        end
+
+        -- normal service; let's run the algorithm
+	    local r = heatingControl (domoticz, trig)
+
+        -- Finally, remove the re-triggering lock
+	    heatingAlgoLock = false
+
+	    return r
+    end
+}
