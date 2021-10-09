@@ -1,0 +1,125 @@
+--
+-- When doors are open, reduce relevant CH setpoints to avoid heating the world
+--
+-- Things this does not do:
+-- (i) Be smart about the setpoint changing (user or schedule) while we've reduced it; we simply assume that the user or schedule knows best and replace the
+--     reversion value we had stored, as we can't tell whether it's a scheduled change (ideally would re-assert the low value while door remains open) or a
+--     user-initiated change (would not override this).
+--
+-- Jeff T, 20/09/2020
+--
+
+return {
+	on = {
+		devices = {
+			'Front door', 'Lounge rear door', 'Dining rear door', 'Kitchen rear door'
+		},
+		timer = {
+		    'every 5 minutes'
+		},
+	},
+	data = {
+        setpointReversionValue = { initial = {} },  -- array of [setpoint idx, reversion temperature]; will be populated as needed
+        doorOpen = { initial = {} },                -- array of [door idx, timestamp]
+        reTriggerLock = { initial = false }         -- flag to avoid the routine re-triggering itself when changing setpoints
+    },
+	execute = function(domoticz, device)
+
+        local tMaxOpenIgnored = 300     -- max time a door can be open before we reduce associated setpoints (will react up to 5 mins later, as the timed event has to run!)
+
+		-- list of doors to be checked, (idx values) which setpoint (idx) they affect and what temperature to reduce to while the door's open
+		-- all these doors must also be listed as device triggers for the event!
+		local doorsSetpoints = {
+            -- {421, 528, 10},      -- test door, test setpoint
+		    {5469, 2157, 10},    -- lounge door, lounge setpoint
+		    {4518, 1714, 10},     -- dining room door, hall setpoint
+		    {4518, 1727, 10},     -- dining room door, kitchen setpoint
+		    {4522, 1727, 10},     -- kitchen rear door, kitchen setpoint
+		    -- {514, 1714, 10},     -- front door, hall setpoint  -- temporarily commented out as no front door sensor!
+		    -- {514, 2699, 10},     -- front door, study setpoint  -- temporarily commented out as no front door sensor!
+	    }
+	    
+        local Time = require('Time')
+        local now = Time()
+        local sp, datum, door, reduced, revert, datum2, opencount
+
+        -- if a setpoint change triggered the event, adjust the stored 'revert' temperature, if any
+        -- for this to work, the setpoints must be listed as device triggers for the event
+        if device.idx ~= nil and device.deviceType == 'Thermostat' and device.deviceSubType == 'SetPoint' then 
+            if domoticz.data.setpointReversionValue[device.idx] ~= nil and not domoticz.data.reTriggerLock then
+                domoticz.data.setpointReversionValue[device.idx] = device.setPoint
+                domoticz.log('Door/heating override:  Setpoint ' .. device.name .. ' changed by schedule or user.  Reversion value changed to match, ' .. device.setPoint)
+            else
+                -- either the setpoint wasn't reduced yet, or we've re-triggered ourself by changing a setpoint; do nothing
+                domoticz.log('Door/heating override:  setpoint has not been overridden or re-trigger lock is set.  Nothing to do.')
+            end
+            return
+        end
+
+        -- if a door triggered the event then act on its new state
+        -- we do this by iterating through all door records in case the door is linked to more than one setpoint
+        if device.idx ~= nil then
+            domoticz.log('Door/heating override: Triggered by door ' .. device.name)
+    	    for _, datum in ipairs(doorsSetpoints) do
+    	        door = domoticz.devices(datum[1])
+    	        sp = domoticz.devices(datum[2])
+    	        reduced = datum[3]
+    
+	            if device.idx == door.idx and device.state == 'Closed' then
+	                -- door closed; revert its associated setpoint if no other associated doors are open
+                    if domoticz.data.setpointReversionValue[sp.idx] ~= nil then
+                        revert = domoticz.data.setpointReversionValue[sp.idx]
+                        if revert ~= nil then
+                            opencount = 0
+                            for _, datum2 in ipairs(doorsSetpoints) do
+                                -- domoticz.log('Checking door ' .. datum2[1] .. ' - setpoint is ' .. datum2[2])
+                                if datum2[2] == sp.idx and domoticz.devices(datum2[1]).state ~= 'Closed' then
+                                    opencount = opencount + 1
+                                    -- domoticz.log('>> relevant door; count now ' .. opencount)
+                                end
+                            end
+                            if opencount == 0 then      -- no open doors for this setpoint
+                                domoticz.data.reTriggerLock = true
+                                sp.updateSetPoint(revert)
+            	                domoticz.data.setpointReversionValue[sp.idx] = nil
+            	                domoticz.log('Door/heating override: ' .. door.name .. ' closed. All doors for setpoint ' .. sp.name .. ' are closed, so reverting it to  ' .. revert)
+        	                else
+        	                    domoticz.log('Door/heating override: ' .. door.name .. ' closed, but other doors remain open so setpoint will not be reset.')
+    	                    end
+        	            else
+        	                domoticz.log('Door/heating override: ' .. door.name .. ' closed.  No stored setpoint to revert to; presume the door was not open for long.')
+    	                end
+        	            domoticz.data.doorOpen[door.idx] = nil
+                    end
+                elseif device.idx == door.idx then  -- door opened
+                    domoticz.data.doorOpen[door.idx] = now.dDate
+    	            domoticz.log('Door/heating override:  ' .. door.name .. ' open.  Timer started.')
+	            -- else it wasn't this door
+                end     -- if device is door
+            end     -- for
+        else
+            domoticz.log('Door/heating override:  Timed check on all doors...')
+    	    for _, datum in ipairs(doorsSetpoints) do
+    	        door = domoticz.devices(datum[1])
+    	        sp = domoticz.devices(datum[2])
+    	        reduced = datum[3]
+                -- domoticz.log('Checking door ' .. door.name .. ' / sp ' .. sp.name .. ' / red ' .. reduced)
+        
+                -- check whether any doors are newly open > 5 minutes
+                if door.state == 'Open' and domoticz.data.doorOpen[door.idx] ~= nil and (now.dDate - domoticz.data.doorOpen[door.idx]) > tMaxOpenIgnored then
+                     if domoticz.data.setpointReversionValue[sp.idx] == nil then
+                        -- store the setpoint, if not already done
+                        domoticz.data.setpointReversionValue[sp.idx] = sp.setPoint
+                        domoticz.data.reTriggerLock = true
+                        sp.updateSetPoint(reduced)
+                        domoticz.log('Door/heating override: ' .. door.name .. ' has been open > 5 mins so setpoint ' .. sp.name .. ' will be temporarily reduced to ' .. (reduced+0))
+                    else
+                        domoticz.log('Door/heating override:  ' .. door.name .. ' has been open > 5 mins and setpoint ' .. sp.name .. ' was already reduced so nothing new to do.')
+                    end
+                end -- if door.state
+    	    end     -- for
+	    end	    -- device not nil
+
+    domoticz.data.reTriggerLock = false
+	end -- execute/function
+}
